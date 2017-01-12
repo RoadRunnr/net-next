@@ -1244,6 +1244,45 @@ out:
 	return skb->len;
 }
 
+static int gtp_genl_enable_socket(struct sk_buff *skb, struct genl_info *info)
+{
+	u32 version, fd, hashsize;
+	struct sock *sk;
+
+	if (!info->attrs[GTPA_VERSION] ||
+	    !info->attrs[GTPA_FD])
+		return -EINVAL;
+
+	if (!info->attrs[GTPA_PDP_HASHSIZE])
+		hashsize = 1024;
+	else
+		hashsize = nla_get_u32(info->attrs[IFLA_GTP_PDP_HASHSIZE]);
+
+	version = nla_get_u32(info->attrs[GTPA_VERSION]);
+	fd = nla_get_u32(info->attrs[GTPA_FD]);
+
+	switch (version) {
+	case GTP_V0:
+		sk = gtp_encap_enable_socket(fd, UDP_ENCAP_GTP0, hashsize);
+		break;
+
+	case GTP_V1:
+		sk = gtp_encap_enable_socket(fd, UDP_ENCAP_GTP1U, hashsize);
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	if (!sk)
+		return -EINVAL;
+
+	if (IS_ERR(sk))
+		return PTR_ERR(sk);
+
+	return 0;
+}
+
 static struct nla_policy gtp_genl_policy[GTPA_MAX + 1] = {
 	[GTPA_LINK]		= { .type = NLA_U32, },
 	[GTPA_VERSION]		= { .type = NLA_U32, },
@@ -1254,6 +1293,8 @@ static struct nla_policy gtp_genl_policy[GTPA_MAX + 1] = {
 	[GTPA_NET_NS_FD]	= { .type = NLA_U32, },
 	[GTPA_I_TEI]		= { .type = NLA_U32, },
 	[GTPA_O_TEI]		= { .type = NLA_U32, },
+	[GTPA_PDP_HASHSIZE]	= { .type = NLA_U32, },
+	[GTPA_FD]		= { .type = NLA_U32, },
 };
 
 static const struct genl_ops gtp_genl_ops[] = {
@@ -1273,6 +1314,12 @@ static const struct genl_ops gtp_genl_ops[] = {
 		.cmd = GTP_CMD_GETPDP,
 		.doit = gtp_genl_get_pdp,
 		.dumpit = gtp_genl_dump_pdp,
+		.policy = gtp_genl_policy,
+		.flags = GENL_ADMIN_PERM,
+	},
+	{
+		.cmd = GTP_CMD_ENABLE_SOCKET,
+		.doit = gtp_genl_enable_socket,
 		.policy = gtp_genl_policy,
 		.flags = GENL_ADMIN_PERM,
 	},
