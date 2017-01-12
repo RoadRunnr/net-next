@@ -381,9 +381,6 @@ static int gtp_dev_init(struct net_device *dev)
 
 static void gtp_dev_uninit(struct net_device *dev)
 {
-	struct gtp_dev *gtp = netdev_priv(dev);
-
-	gtp_encap_disable(gtp);
 	free_percpu(dev->tstats);
 }
 
@@ -647,9 +644,6 @@ static int gtp_newlink(struct net *src_net, struct net_device *dev,
 	struct gtp_net *gn;
 	int hashsize, err;
 
-	if (!data[IFLA_GTP_FD0] && !data[IFLA_GTP_FD1])
-		return -EINVAL;
-
 	gtp = netdev_priv(dev);
 
 	if (!data[IFLA_GTP_PDP_HASHSIZE])
@@ -689,8 +683,11 @@ static void gtp_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct gtp_dev *gtp = netdev_priv(dev);
 
-	gtp_encap_disable(gtp);
 	gtp_hashtable_free(gtp);
+	if (gtp->sk0)
+		sock_put(gtp->sk0);
+	if (gtp->sk1u)
+		sock_put(gtp->sk1u);
 	list_del_rcu(&gtp->list);
 	unregister_netdevice_queue(dev, head);
 }
@@ -1008,9 +1005,10 @@ static void pdp_context_delete(struct pdp_ctx *pctx)
 
 static int gtp_genl_new_pdp(struct sk_buff *skb, struct genl_info *info)
 {
+	struct socket *sock = NULL;
+	struct sock *sk = NULL;
 	unsigned int version;
 	struct gtp_dev *gtp;
-	struct sock *sk;
 	int err;
 
 	if (!info->attrs[GTPA_VERSION] ||
@@ -1045,12 +1043,14 @@ static int gtp_genl_new_pdp(struct sk_buff *skb, struct genl_info *info)
 		goto out_unlock;
 	}
 
-	if (version == GTP_V0)
+	if (info->attrs[GTPA_FD]) {
+		sock = sockfd_lookup(nla_get_u32(info->attrs[GTPA_FD]), &err);
+		if (sock)
+			sk = sock->sk;
+	} else if (version == GTP_V0)
 		sk = gtp->sk0;
 	else if (version == GTP_V1)
 		sk = gtp->sk1u;
-	else
-		sk = NULL;
 
 	if (!sk) {
 		err = -ENODEV;
@@ -1058,6 +1058,9 @@ static int gtp_genl_new_pdp(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	err = ipv4_pdp_add(gtp, sk, info);
+
+	if (sock)
+		sockfd_put(sock);
 
 out_unlock:
 	rcu_read_unlock();
@@ -1079,12 +1082,66 @@ static struct pdp_ctx *gtp_find_pdp_by_link(struct net *net,
 	return ipv4_pdp_find(gtp, nla_get_be32(nla[GTPA_MS_ADDRESS]));
 }
 
+static struct pdp_ctx *gtp_genl_find_pdp_by_socket(struct net *net,
+						   struct nlattr *nla[])
+{
+	struct socket *sock;
+	struct gtp_sock *gsk;
+	struct pdp_ctx *pctx;
+	int fd, err = 0;
+
+	if (!nla[GTPA_FD])
+		return ERR_PTR(-EINVAL);
+
+	fd = nla_get_u32(nla[GTPA_FD]);
+	sock = sockfd_lookup(fd, &err);
+	if (!sock) {
+		pr_debug("gtp socket fd=%d not found\n", fd);
+		return ERR_PTR(-EBADF);
+	}
+
+	gsk = rcu_dereference_sk_user_data(sock->sk);
+	if (!gsk) {
+		pctx = ERR_PTR(-EINVAL);
+		goto out_sock;
+	}
+
+	switch (nla_get_u32(nla[GTPA_VERSION])) {
+	case GTP_V0:
+		if (!nla[GTPA_TID]) {
+			pctx = ERR_PTR(-EINVAL);
+			break;
+		}
+		pctx = gtp0_pdp_find(gsk, nla_get_u64(nla[GTPA_TID]));
+		break;
+
+	case GTP_V1:
+		if (!nla[GTPA_I_TEI]) {
+			pctx = ERR_PTR(-EINVAL);
+			break;
+		}
+		pctx = gtp1_pdp_find(gsk, nla_get_u64(nla[GTPA_I_TEI]));
+		break;
+
+	default:
+		pctx = ERR_PTR(-EINVAL);
+		break;
+	}
+
+out_sock:
+	sockfd_put(sock);
+	return pctx;
+}
+
 static struct pdp_ctx *gtp_find_pdp(struct net *net, struct nlattr *nla[])
 {
 	struct pdp_ctx *pctx;
 
 	if (nla[GTPA_LINK])
 		pctx = gtp_find_pdp_by_link(net, nla);
+	else if (nla[GTPA_FD])
+		pctx = gtp_genl_find_pdp_by_socket(net, nla);
+
 	else
 		pctx = ERR_PTR(-EINVAL);
 
