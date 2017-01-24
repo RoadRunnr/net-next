@@ -61,6 +61,10 @@ struct pdp_ctx {
 	struct sock		*sk;
 	struct net_device       *dev;
 
+#ifdef CONFIG_DST_CACHE
+	struct dst_cache        dst_cache;
+#endif
+
 	atomic_t		tx_seq;
 	struct rcu_head		rcu_head;
 };
@@ -377,17 +381,30 @@ static void gtp_dev_uninit(struct net_device *dev)
 }
 
 static struct rtable *ip4_route_output_gtp(struct flowi4 *fl4,
-					   const struct sock *sk,
-					   __be32 daddr)
+					   struct pdp_ctx *pctx)
 {
+	const struct sock *sk = pctx->sk;
+	struct rtable *rt;
+
 	memset(fl4, 0, sizeof(*fl4));
 	fl4->flowi4_oif		= sk->sk_bound_dev_if;
-	fl4->daddr		= daddr;
+	fl4->daddr		= pctx->sgsn_addr_ip4.s_addr;
 	fl4->saddr		= inet_sk(sk)->inet_saddr;
 	fl4->flowi4_tos		= RT_CONN_FLAGS(sk);
 	fl4->flowi4_proto	= sk->sk_protocol;
 
-	return ip_route_output_key(sock_net(sk), fl4);
+	rt = dst_cache_get_ip4(&pctx->dst_cache, &fl4->daddr);
+	if (rt)
+		return rt;
+
+	rt = ip_route_output_key(sock_net(sk), fl4);
+	if (IS_ERR(rt)) {
+		netdev_dbg(pctx->dev, "no route to SGSN %pI4\n", &fl4->daddr);
+		return ERR_PTR(-ENETUNREACH);
+	}
+
+	dst_cache_set_ip4(&pctx->dst_cache, &rt->dst, fl4->daddr);
+	return rt;
 }
 
 static inline void gtp0_push_header(struct sk_buff *skb, struct pdp_ctx *pctx)
@@ -491,10 +508,8 @@ static int gtp_build_skb_ip4(struct sk_buff *skb, struct net_device *dev,
 	}
 	netdev_dbg(dev, "found PDP context %p\n", pctx);
 
-	rt = ip4_route_output_gtp(&fl4, pctx->sk, pctx->sgsn_addr_ip4.s_addr);
+	rt = ip4_route_output_gtp(&fl4, pctx);
 	if (IS_ERR(rt)) {
-		netdev_dbg(dev, "no route to SSGN %pI4\n",
-			   &pctx->sgsn_addr_ip4.s_addr);
 		dev->stats.tx_carrier_errors++;
 		goto err;
 	}
@@ -875,6 +890,8 @@ static void ipv4_pdp_fill(struct pdp_ctx *pctx, struct genl_info *info)
 	pctx->ms_addr_ip4.s_addr =
 		nla_get_be32(info->attrs[GTPA_MS_ADDRESS]);
 
+	dst_cache_reset(&pctx->dst_cache);
+
 	switch (pctx->gtp_version) {
 	case GTP_V0:
 		/* According to TS 09.60, sections 7.5.1 and 7.5.2, the flow
@@ -902,6 +919,7 @@ static int ipv4_pdp_add(struct gtp_dev *gtp, struct sock *sk,
 	struct gtp_sock *gsk;
 	bool found = false;
 	__be32 ms_addr;
+	int err;
 
 	gsk = rcu_dereference_sk_user_data(sk);
 	if (!gsk)
@@ -939,6 +957,12 @@ static int ipv4_pdp_add(struct gtp_dev *gtp, struct sock *sk,
 	pctx = kmalloc(sizeof(struct pdp_ctx), GFP_KERNEL);
 	if (pctx == NULL)
 		return -ENOMEM;
+
+	err = dst_cache_init(&pctx->dst_cache, GFP_KERNEL);
+	if (err) {
+		kfree(pctx);
+		return err;
+	}
 
 	sock_hold(sk);
 	pctx->sk = sk;
@@ -984,6 +1008,7 @@ static void pdp_context_free(struct rcu_head *head)
 	struct pdp_ctx *pctx = container_of(head, struct pdp_ctx, rcu_head);
 
 	sock_put(pctx->sk);
+	dst_cache_destroy(&pctx->dst_cache);
 	kfree(pctx);
 }
 
