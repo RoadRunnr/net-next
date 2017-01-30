@@ -67,8 +67,6 @@ struct pdp_ctx {
 
 /* One instance of the GTP device. */
 struct gtp_dev {
-	struct list_head	list;
-
 	struct sock		*sk0;
 	struct sock		*sk1u;
 
@@ -82,12 +80,6 @@ struct gtp_dev {
 struct gtp_sock {
 	unsigned int		hash_size;
 	struct hlist_head	tid_hash[];
-};
-
-static unsigned int gtp_net_id __read_mostly;
-
-struct gtp_net {
-	struct list_head gtp_dev_list;
 };
 
 static u32 gtp_h_initval;
@@ -641,7 +633,6 @@ static int gtp_newlink(struct net *src_net, struct net_device *dev,
 			struct nlattr *tb[], struct nlattr *data[])
 {
 	struct gtp_dev *gtp;
-	struct gtp_net *gn;
 	int hashsize, err;
 
 	gtp = netdev_priv(dev);
@@ -665,9 +656,6 @@ static int gtp_newlink(struct net *src_net, struct net_device *dev,
 		goto out_hashtable;
 	}
 
-	gn = net_generic(dev_net(dev), gtp_net_id);
-	list_add_rcu(&gtp->list, &gn->gtp_dev_list);
-
 	netdev_dbg(dev, "registered new GTP interface\n");
 
 	return 0;
@@ -688,7 +676,6 @@ static void gtp_dellink(struct net_device *dev, struct list_head *head)
 		sock_put(gtp->sk0);
 	if (gtp->sk1u)
 		sock_put(gtp->sk1u);
-	list_del_rcu(&gtp->list);
 	unregister_netdevice_queue(dev, head);
 }
 
@@ -848,6 +835,10 @@ static int gtp_encap_enable(struct gtp_dev *gtp, int hsize,
 
 	return 0;
 }
+static inline bool netif_is_gtp(const struct net_device *dev)
+{
+	return dev->netdev_ops == &gtp_netdev_ops;
+}
 
 static struct gtp_dev *gtp_find_dev(struct net *src_net, struct nlattr *nla[])
 {
@@ -868,7 +859,7 @@ static struct gtp_dev *gtp_find_dev(struct net *src_net, struct nlattr *nla[])
 
 	/* Check if there's an existing gtpX device to configure */
 	dev = dev_get_by_index_rcu(net, nla_get_u32(nla[GTPA_LINK]));
-	if (dev->netdev_ops == &gtp_netdev_ops)
+	if (netif_is_gtp(dev))
 		gtp = netdev_priv(dev);
 
 	put_net(net);
@@ -1257,47 +1248,67 @@ err_unlock:
 	return err;
 }
 
-static int gtp_genl_dump_pdp(struct sk_buff *skb,
-				struct netlink_callback *cb)
+static int gtp_genl_dump_dev(struct net_device *dev,
+			     struct sk_buff *skb,
+			     struct netlink_callback *cb)
 {
-	struct gtp_dev *last_gtp = (struct gtp_dev *)cb->args[2], *gtp;
-	struct net *net = sock_net(skb->sk);
-	struct gtp_net *gn = net_generic(net, gtp_net_id);
-	unsigned long tid = cb->args[1];
-	int i, k = cb->args[0], ret;
+	struct gtp_dev *gtp = netdev_priv(dev);
+	unsigned int k = cb->args[1];
+	unsigned long tid = cb->args[2];
+	unsigned int i;
 	struct pdp_ctx *pctx;
+	int ret;
 
-	if (cb->args[4])
-		return 0;
+	for (i = k; i < gtp->hash_size; i++) {
+		hlist_for_each_entry_rcu(pctx, &gtp->addr_hash[i], hlist_addr) {
+			if (tid && tid != pctx->u.tid)
+				continue;
+			else
+				tid = 0;
 
-	list_for_each_entry_rcu(gtp, &gn->gtp_dev_list, list) {
-		if (last_gtp && last_gtp != gtp)
-			continue;
-		else
-			last_gtp = NULL;
-
-		for (i = k; i < gtp->hash_size; i++) {
-			hlist_for_each_entry_rcu(pctx, &gtp->addr_hash[i], hlist_addr) {
-				if (tid && tid != pctx->u.tid)
-					continue;
-				else
-					tid = 0;
-
-				ret = gtp_genl_fill_info(skb,
-							 NETLINK_CB(cb->skb).portid,
-							 cb->nlh->nlmsg_seq,
-							 cb->nlh->nlmsg_type, pctx);
-				if (ret < 0) {
-					cb->args[0] = i;
-					cb->args[1] = pctx->u.tid;
-					cb->args[2] = (unsigned long)gtp;
-					goto out;
-				}
+			ret = gtp_genl_fill_info(skb,
+						 NETLINK_CB(cb->skb).portid,
+						 cb->nlh->nlmsg_seq,
+						 cb->nlh->nlmsg_type, pctx);
+			if (ret < 0) {
+				cb->args[1] = i;
+				cb->args[2] = pctx->u.tid;
+				return ret;
 			}
 		}
 	}
-	cb->args[4] = 1;
-out:
+
+	return 0;
+}
+
+static int gtp_genl_dump_pdp(struct sk_buff *skb,
+			     struct netlink_callback *cb)
+{
+	struct net *net = sock_net(skb->sk);
+	struct net_device *dev;
+	int dev_idx, d;
+
+	dev_idx = cb->args[0];
+
+	d = 0;
+
+	rcu_read_lock();
+	for_each_netdev_rcu(net, dev) {
+		if (d < dev_idx)
+			goto next;
+
+		if (!netif_is_gtp(dev))
+			goto next;
+
+		if (gtp_genl_dump_dev(dev, skb, cb) < 0)
+			goto done;
+next:
+		d++;
+	}
+
+done:
+	rcu_read_unlock();
+	cb->args[0] = d;
 	return skb->len;
 }
 
@@ -1393,35 +1404,6 @@ static struct genl_family gtp_genl_family __ro_after_init = {
 	.n_ops		= ARRAY_SIZE(gtp_genl_ops),
 };
 
-static int __net_init gtp_net_init(struct net *net)
-{
-	struct gtp_net *gn = net_generic(net, gtp_net_id);
-
-	INIT_LIST_HEAD(&gn->gtp_dev_list);
-	return 0;
-}
-
-static void __net_exit gtp_net_exit(struct net *net)
-{
-	struct gtp_net *gn = net_generic(net, gtp_net_id);
-	struct gtp_dev *gtp;
-	LIST_HEAD(list);
-
-	rtnl_lock();
-	list_for_each_entry(gtp, &gn->gtp_dev_list, list)
-		gtp_dellink(gtp->dev, &list);
-
-	unregister_netdevice_many(&list);
-	rtnl_unlock();
-}
-
-static struct pernet_operations gtp_net_ops = {
-	.init	= gtp_net_init,
-	.exit	= gtp_net_exit,
-	.id	= &gtp_net_id,
-	.size	= sizeof(struct gtp_net),
-};
-
 static int __init gtp_init(void)
 {
 	int err;
@@ -1436,16 +1418,10 @@ static int __init gtp_init(void)
 	if (err < 0)
 		goto unreg_rtnl_link;
 
-	err = register_pernet_subsys(&gtp_net_ops);
-	if (err < 0)
-		goto unreg_genl_family;
-
 	pr_info("GTP module loaded (pdp ctx size %zd bytes)\n",
 		sizeof(struct pdp_ctx));
 	return 0;
 
-unreg_genl_family:
-	genl_unregister_family(&gtp_genl_family);
 unreg_rtnl_link:
 	rtnl_link_unregister(&gtp_link_ops);
 error_out:
@@ -1456,7 +1432,6 @@ late_initcall(gtp_init);
 
 static void __exit gtp_fini(void)
 {
-	unregister_pernet_subsys(&gtp_net_ops);
 	genl_unregister_family(&gtp_genl_family);
 	rtnl_link_unregister(&gtp_link_ops);
 
