@@ -56,7 +56,13 @@ struct pdp_ctx {
 	u16			af;
 
 	struct in_addr		ms_addr_ip4;
-	struct in_addr		sgsn_addr_ip4;
+
+	union {
+		struct in_addr	ip4;
+#if IS_ENABLED(CONFIG_IPV6)
+		struct in6_addr	ip6;
+#endif
+	} sgsn_addr;
 
 	struct sock		*sk;
 	struct net_device       *dev;
@@ -398,7 +404,7 @@ static struct rtable *ip4_route_output_gtp(struct flowi4 *fl4,
 
 	memset(fl4, 0, sizeof(*fl4));
 	fl4->flowi4_oif		= sk->sk_bound_dev_if;
-	fl4->daddr		= pctx->sgsn_addr_ip4.s_addr;
+	fl4->daddr		= pctx->sgsn_addr.ip4.s_addr;
 	fl4->saddr		= inet_sk(sk)->inet_saddr;
 	fl4->flowi4_tos		= RT_CONN_FLAGS(sk);
 	fl4->flowi4_proto	= sk->sk_protocol;
@@ -416,6 +422,34 @@ static struct rtable *ip4_route_output_gtp(struct flowi4 *fl4,
 	dst_cache_set_ip4(&pctx->dst_cache, &rt->dst, fl4->daddr);
 	return rt;
 }
+
+#if IS_ENABLED(CONFIG_IPV6)
+static struct dst_entry *ip6_route_output_gtp(struct flowi6 *fl6,
+					      struct pdp_ctx *pctx)
+{
+	const struct sock *sk = pctx->sk;
+	struct dst_entry *ndst;
+
+	memset(fl6, 0, sizeof(*fl6));
+	fl6->flowi6_oif		= sk->sk_bound_dev_if;
+	fl6->daddr		= pctx->sgsn_addr.ip6;
+	fl6->saddr		= inet6_sk(sk)->saddr;
+	fl6->flowi6_proto	= sk->sk_protocol;
+
+	ndst = dst_cache_get_ip6(&pctx->dst_cache, &fl6->daddr);
+	if (ndst)
+		return ndst;
+
+	ndst = ip6_route_output(sock_net(sk), NULL, fl6);
+	if (ndst->error) {
+		netdev_dbg(pctx->dev, "no route to SSGN %pI6\n", &fl6->daddr);
+		return ERR_PTR(-ENETUNREACH);
+	}
+
+	dst_cache_set_ip6(&pctx->dst_cache, ndst, &fl6->daddr);
+	return ndst;
+}
+#endif
 
 static inline void gtp0_push_header(struct sk_buff *skb, struct pdp_ctx *pctx)
 {
@@ -528,7 +562,7 @@ static int gtp_dev_xmit_ip4(struct pdp_ctx *pctx, struct sk_buff *skb,
 
 	if (rt->dst.dev == dev) {
 		netdev_dbg(dev, "circular route to SSGN %pI4\n",
-			   &pctx->sgsn_addr_ip4.s_addr);
+			   &pctx->sgsn_addr.ip4.s_addr);
 		dev->stats.collisions++;
 		goto err_rt;
 	}
@@ -554,6 +588,52 @@ err:
 	return -EBADMSG;
 }
 
+#if IS_ENABLED(CONFIG_IPV6)
+static int gtp_dev_xmit_ip6(struct pdp_ctx *pctx, struct sk_buff *skb,
+			    struct net_device *dev)
+{
+	const struct iphdr *iph = ip_hdr(skb);
+	struct dst_entry *ndst;
+	struct flowi6 fl6;
+	__be16 gtph_port;
+
+
+	ndst = ip6_route_output_gtp(&fl6, pctx);
+	if (IS_ERR(ndst)) {
+		dev->stats.tx_carrier_errors++;
+		goto err;
+	}
+
+	/* There is a routing loop. */
+	if (ndst->dev == dev) {
+		netdev_dbg(dev, "circular route to SSGN %pI6\n",
+			   &pctx->sgsn_addr.ip6);
+		dev->stats.collisions++;
+		goto err_dst;
+	}
+
+	if (gtp_update_pmtu(pctx, skb, dev, ndst, iph->frag_off,
+			    sizeof(struct ipv6hdr) + sizeof(struct udphdr), iph))
+	    goto err_dst;
+
+	skb_dst_drop(skb);
+	gtp_push_header(skb, pctx);
+
+	gtph_port = get_dst_port(pctx);
+
+	udp_tunnel6_xmit_skb(ndst, pctx->sk, skb, ndst->dev, &fl6.saddr,
+			     &fl6.daddr, 0, ip6_dst_hoplimit(ndst), 0,
+			     gtph_port, gtph_port, false);
+
+	return 0;
+
+err_dst:
+	dst_release(ndst);
+err:
+	return -EBADMSG;
+}
+#endif
+
 static netdev_tx_t gtp_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct pdp_ctx *pctx;
@@ -575,6 +655,11 @@ static netdev_tx_t gtp_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	case AF_INET:
 		err = gtp_dev_xmit_ip4(pctx, skb, dev);
 		break;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		err = gtp_dev_xmit_ip6(pctx, skb, dev);
+		break;
+#endif
 	default:
 		err = -EOPNOTSUPP;
 	}
@@ -865,8 +950,17 @@ static void ipv4_pdp_fill(struct pdp_ctx *pctx, struct genl_info *info)
 {
 	pctx->gtp_version = nla_get_u32(info->attrs[GTPA_VERSION]);
 	pctx->af = AF_INET;
-	pctx->sgsn_addr_ip4.s_addr =
-		nla_get_be32(info->attrs[GTPA_SGSN_ADDRESS]);
+
+	if (info->attrs[GTPA_SGSN_ADDRESS]) {
+		pctx->sgsn_addr.ip4.s_addr =
+			nla_get_be32(info->attrs[GTPA_SGSN_ADDRESS]);
+#if IS_ENABLED(CONFIG_IPV6)
+	} else if (info->attrs[GTPA_SGSN_ADDRESS6]) {
+		pctx->sgsn_addr.ip6 =
+                        nla_get_in6_addr(info->attrs[GTPA_SGSN_ADDRESS6]);
+#endif
+	}
+
 	pctx->ms_addr_ip4.s_addr =
 		nla_get_be32(info->attrs[GTPA_MS_ADDRESS]);
 
@@ -904,6 +998,25 @@ static int ipv4_pdp_add(struct gtp_dev *gtp, struct sock *sk,
 	gsk = rcu_dereference_sk_user_data(sk);
 	if (!gsk)
 		return -ENODEV;
+
+	switch (sk->sk_family) {
+	case AF_INET:
+		if (!info->attrs[GTPA_SGSN_ADDRESS])
+			return -EINVAL;
+
+		break;
+	case AF_INET6:
+#if IS_ENABLED(CONFIG_IPV6)
+		if (!info->attrs[GTPA_SGSN_ADDRESS6])
+			return -EINVAL;
+
+		break;
+#else
+		return -EPFNOSUPPORT;
+#endif
+	default:
+		return -EINVAL;
+	}
 
 	ms_addr = nla_get_be32(info->attrs[GTPA_MS_ADDRESS]);
 	hash_ms = ipv4_hashfn(ms_addr) % gtp->hash_size;
@@ -970,13 +1083,13 @@ static int ipv4_pdp_add(struct gtp_dev *gtp, struct sock *sk,
 	switch (pctx->gtp_version) {
 	case GTP_V0:
 		netdev_dbg(dev, "GTPv0-U: new PDP ctx id=%llx ssgn=%pI4 ms=%pI4 (pdp=%p)\n",
-			   pctx->u.v0.tid, &pctx->sgsn_addr_ip4,
+			   pctx->u.v0.tid, &pctx->sgsn_addr.ip4,
 			   &pctx->ms_addr_ip4, pctx);
 		break;
 	case GTP_V1:
 		netdev_dbg(dev, "GTPv1-U: new PDP ctx id=%x/%x ssgn=%pI4 ms=%pI4 (pdp=%p)\n",
 			   pctx->u.v1.i_tei, pctx->u.v1.o_tei,
-			   &pctx->sgsn_addr_ip4, &pctx->ms_addr_ip4, pctx);
+			   &pctx->sgsn_addr.ip4, &pctx->ms_addr_ip4, pctx);
 		break;
 	}
 
@@ -1007,9 +1120,11 @@ static int gtp_genl_new_pdp(struct sk_buff *skb, struct genl_info *info)
 	struct gtp_dev *gtp;
 	int err;
 
+	if (info->attrs[GTPA_SGSN_ADDRESS] && info->attrs[GTPA_SGSN_ADDRESS6])
+		return -EINVAL;
+
 	if (!info->attrs[GTPA_VERSION] ||
 	    !info->attrs[GTPA_LINK] ||
-	    !info->attrs[GTPA_SGSN_ADDRESS] ||
 	    !info->attrs[GTPA_MS_ADDRESS])
 		return -EINVAL;
 
@@ -1190,9 +1305,23 @@ static int gtp_genl_fill_info(struct sk_buff *skb, u32 snd_portid, u32 snd_seq,
 		goto nlmsg_failure;
 
 	if (nla_put_u32(skb, GTPA_VERSION, pctx->gtp_version) ||
-	    nla_put_be32(skb, GTPA_SGSN_ADDRESS, pctx->sgsn_addr_ip4.s_addr) ||
 	    nla_put_be32(skb, GTPA_MS_ADDRESS, pctx->ms_addr_ip4.s_addr))
 		goto nla_put_failure;
+
+	switch (pctx->sk->sk_family) {
+	case AF_INET:
+		if (nla_put_be32(skb, GTPA_SGSN_ADDRESS,
+				 pctx->sgsn_addr.ip4.s_addr))
+			goto nla_put_failure;
+		break;
+#if IS_ENABLED(CONFIG_IPV6)
+	case AF_INET6:
+		if (nla_put_in6_addr(skb, GTPA_SGSN_ADDRESS6,
+				     &pctx->sgsn_addr.ip6))
+			goto nla_put_failure;
+		break;
+#endif
+	}
 
 	switch (pctx->gtp_version) {
 	case GTP_V0:
@@ -1361,6 +1490,7 @@ static struct nla_policy gtp_genl_policy[GTPA_MAX + 1] = {
 	[GTPA_VERSION]		= { .type = NLA_U32, },
 	[GTPA_TID]		= { .type = NLA_U64, },
 	[GTPA_SGSN_ADDRESS]	= { .type = NLA_U32, },
+	[GTPA_SGSN_ADDRESS6]	= { .len = sizeof(struct in6_addr) },
 	[GTPA_MS_ADDRESS]	= { .type = NLA_U32, },
 	[GTPA_FLOW]		= { .type = NLA_U16, },
 	[GTPA_NET_NS_FD]	= { .type = NLA_U32, },

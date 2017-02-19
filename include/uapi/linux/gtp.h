@@ -30,6 +30,7 @@ enum gtp_attrs {
 	GTPA_PAD,
 	GTPA_PDP_HASHSIZE,
 	GTPA_FD,
+	GTPA_SGSN_ADDRESS6,
 	__GTPA_MAX,
 };
 #define GTPA_MAX (__GTPA_MAX + 1)
