@@ -471,6 +471,40 @@ static void gtp_push_header(struct sk_buff *skb, struct gtp_pktinfo *pktinfo)
 	}
 }
 
+static int gtp_update_pmtu(struct pdp_ctx *pctx, struct sk_buff *skb,
+			  struct net_device *dev, struct dst_entry *ndst,
+			  __be16 df, int tnl_header_len,
+			  const struct iphdr *inner_iph)
+{
+	int mtu;
+
+	if (df) {
+		mtu = dst_mtu(ndst) - dev->hard_header_len - tnl_header_len;
+		switch (pctx->gtp_version) {
+		case GTP_V0:
+			mtu -= sizeof(struct gtp0_header);
+			break;
+		case GTP_V1:
+			mtu -= sizeof(struct gtp1_header);
+			break;
+		}
+	} else
+		mtu = skb_dst(skb) ? dst_mtu(skb_dst(skb)) : dev->mtu;
+
+	if (skb_dst(skb))
+		skb_dst(skb)->ops->update_pmtu(skb_dst(skb), NULL, skb, mtu);
+
+	if (!skb_is_gso(skb) && (inner_iph->frag_off & htons(IP_DF)) &&
+	    mtu < ntohs(inner_iph->tot_len)) {
+		netdev_dbg(dev, "packet too big, fragmentation needed\n");
+		memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
+		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED, htonl(mtu));
+		return -E2BIG;
+	}
+
+	return 0;
+ }
+
 static inline void gtp_set_pktinfo_ipv4(struct gtp_pktinfo *pktinfo,
 					struct sock *sk, struct iphdr *iph,
 					struct pdp_ctx *pctx, struct rtable *rt,
@@ -493,8 +527,6 @@ static int gtp_build_skb_ip4(struct sk_buff *skb, struct net_device *dev,
 	struct rtable *rt;
 	struct flowi4 fl4;
 	struct iphdr *iph;
-	__be16 df;
-	int mtu;
 
 	/* Read the IP destination address and resolve the PDP context.
 	 * Prepend PDP header with TEI/TID from PDP ctx.
@@ -521,35 +553,11 @@ static int gtp_build_skb_ip4(struct sk_buff *skb, struct net_device *dev,
 		goto err_rt;
 	}
 
-	skb_dst_drop(skb);
-
-	/* This is similar to tnl_update_pmtu(). */
-	df = iph->frag_off;
-	if (df) {
-		mtu = dst_mtu(&rt->dst) - dev->hard_header_len -
-			sizeof(struct iphdr) - sizeof(struct udphdr);
-		switch (pctx->gtp_version) {
-		case GTP_V0:
-			mtu -= sizeof(struct gtp0_header);
-			break;
-		case GTP_V1:
-			mtu -= sizeof(struct gtp1_header);
-			break;
-		}
-	} else {
-		mtu = dst_mtu(&rt->dst);
-	}
-
-	rt->dst.ops->update_pmtu(&rt->dst, NULL, skb, mtu);
-
-	if (!skb_is_gso(skb) && (iph->frag_off & htons(IP_DF)) &&
-	    mtu < ntohs(iph->tot_len)) {
-		netdev_dbg(dev, "packet too big, fragmentation needed\n");
-		memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
-			  htonl(mtu));
+	if (gtp_update_pmtu(pctx, skb, dev, &rt->dst, iph->frag_off,
+			    sizeof(struct iphdr) + sizeof(struct udphdr), iph))
 		goto err_rt;
-	}
+
+	skb_dst_drop(skb);
 
 	gtp_set_pktinfo_ipv4(pktinfo, pctx->sk, iph, pctx, rt, &fl4, dev);
 	gtp_push_header(skb, pktinfo);
