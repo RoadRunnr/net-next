@@ -155,6 +155,23 @@ static struct pdp_ctx *ipv4_pdp_find(struct gtp_dev *gtp, __be32 ms_addr)
 	return NULL;
 }
 
+/* Resolve a PDP context based on IP address of MS. */
+static struct pdp_ctx *ip_pdp_find(struct sk_buff *skb, struct net_device *dev)
+{
+	unsigned int proto = ntohs(skb->protocol);
+	struct gtp_dev *gtp = netdev_priv(dev);
+
+	switch (proto) {
+	case ETH_P_IP: {
+		struct iphdr *iph = ip_hdr(skb);
+
+		return ipv4_pdp_find(gtp, iph->daddr);
+	}
+	}
+
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
 static bool gtp_check_src_ms_ipv4(struct sk_buff *skb, struct pdp_ctx *pctx,
 				  unsigned int hdrlen)
 {
@@ -447,28 +464,24 @@ static inline void gtp1_push_header(struct sk_buff *skb, struct pdp_ctx *pctx)
 	 */
 }
 
-struct gtp_pktinfo {
-	struct sock		*sk;
-	struct iphdr		*iph;
-	struct flowi4		fl4;
-	struct rtable		*rt;
-	struct pdp_ctx		*pctx;
-	struct net_device	*dev;
-	__be16			gtph_port;
-};
-
-static void gtp_push_header(struct sk_buff *skb, struct gtp_pktinfo *pktinfo)
+static void gtp_push_header(struct sk_buff *skb, struct pdp_ctx *pctx)
 {
-	switch (pktinfo->pctx->gtp_version) {
+	switch (pctx->gtp_version) {
 	case GTP_V0:
-		pktinfo->gtph_port = htons(GTP0_PORT);
-		gtp0_push_header(skb, pktinfo->pctx);
+		gtp0_push_header(skb, pctx);
 		break;
 	case GTP_V1:
-		pktinfo->gtph_port = htons(GTP1U_PORT);
-		gtp1_push_header(skb, pktinfo->pctx);
+		gtp1_push_header(skb, pctx);
 		break;
 	}
+}
+
+static int get_dst_port(struct pdp_ctx *pctx)
+{
+	if (pctx->gtp_version == GTP_V0)
+		return htons(GTP0_PORT);
+
+	return htons(GTP1U_PORT);
 }
 
 static int gtp_update_pmtu(struct pdp_ctx *pctx, struct sk_buff *skb,
@@ -503,42 +516,16 @@ static int gtp_update_pmtu(struct pdp_ctx *pctx, struct sk_buff *skb,
 	}
 
 	return 0;
- }
-
-static inline void gtp_set_pktinfo_ipv4(struct gtp_pktinfo *pktinfo,
-					struct sock *sk, struct iphdr *iph,
-					struct pdp_ctx *pctx, struct rtable *rt,
-					struct flowi4 *fl4,
-					struct net_device *dev)
-{
-	pktinfo->sk	= sk;
-	pktinfo->iph	= iph;
-	pktinfo->pctx	= pctx;
-	pktinfo->rt	= rt;
-	pktinfo->fl4	= *fl4;
-	pktinfo->dev	= dev;
 }
 
-static int gtp_build_skb_ip4(struct sk_buff *skb, struct net_device *dev,
-			     struct gtp_pktinfo *pktinfo)
+static int gtp_dev_xmit_ip4(struct pdp_ctx *pctx, struct sk_buff *skb,
+			    struct net_device *dev)
 {
-	struct gtp_dev *gtp = netdev_priv(dev);
-	struct pdp_ctx *pctx;
+	const struct iphdr *iph = ip_hdr(skb);
 	struct rtable *rt;
 	struct flowi4 fl4;
-	struct iphdr *iph;
-
-	/* Read the IP destination address and resolve the PDP context.
-	 * Prepend PDP header with TEI/TID from PDP ctx.
-	 */
-	iph = ip_hdr(skb);
-	pctx = ipv4_pdp_find(gtp, iph->daddr);
-	if (!pctx) {
-		netdev_dbg(dev, "no PDP ctx found for %pI4, skip\n",
-			   &iph->daddr);
-		return -ENOENT;
-	}
-	netdev_dbg(dev, "found PDP context %p\n", pctx);
+	__be16 gtph_port;
+	__u8 tos;
 
 	rt = ip4_route_output_gtp(&fl4, pctx);
 	if (IS_ERR(rt)) {
@@ -558,9 +545,14 @@ static int gtp_build_skb_ip4(struct sk_buff *skb, struct net_device *dev,
 		goto err_rt;
 
 	skb_dst_drop(skb);
+	gtp_push_header(skb, pctx);
 
-	gtp_set_pktinfo_ipv4(pktinfo, pctx->sk, iph, pctx, rt, &fl4, dev);
-	gtp_push_header(skb, pktinfo);
+	tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, ip_hdr(skb), skb);
+	gtph_port = get_dst_port(pctx);
+
+	udp_tunnel_xmit_skb(rt, pctx->sk, skb, fl4.saddr, fl4.daddr, tos,
+			    ip4_dst_hoplimit(&rt->dst), 0,
+			    gtph_port, gtph_port, true, false);
 
 	return 0;
 err_rt:
@@ -571,8 +563,7 @@ err:
 
 static netdev_tx_t gtp_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	unsigned int proto = ntohs(skb->protocol);
-	struct gtp_pktinfo pktinfo;
+	struct pdp_ctx *pctx;
 	int err;
 
 	/* Ensure there is sufficient headroom. */
@@ -581,36 +572,24 @@ static netdev_tx_t gtp_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	skb_reset_inner_headers(skb);
 
-	/* PDP context lookups in gtp_build_skb_*() need rcu read-side lock. */
 	rcu_read_lock();
-	switch (proto) {
-	case ETH_P_IP:
-		err = gtp_build_skb_ip4(skb, dev, &pktinfo);
+	pctx = ip_pdp_find(skb, dev);
+	if (IS_ERR(pctx))
+		return PTR_ERR(pctx);
+	netdev_dbg(dev, "found PDP context %p\n", pctx);
+
+	switch (pctx->sk->sk_family) {
+	case AF_INET:
+		err = gtp_dev_xmit_ip4(pctx, skb, dev);
 		break;
 	default:
 		err = -EOPNOTSUPP;
-		break;
 	}
 	rcu_read_unlock();
 
-	if (err < 0)
-		goto tx_err;
+	if (!err)
+		return NETDEV_TX_OK;
 
-	switch (proto) {
-	case ETH_P_IP:
-		netdev_dbg(pktinfo.dev, "gtp -> IP src: %pI4 dst: %pI4\n",
-			   &pktinfo.iph->saddr, &pktinfo.iph->daddr);
-		udp_tunnel_xmit_skb(pktinfo.rt, pktinfo.sk, skb,
-				    pktinfo.fl4.saddr, pktinfo.fl4.daddr,
-				    pktinfo.iph->tos,
-				    ip4_dst_hoplimit(&pktinfo.rt->dst),
-				    0,
-				    pktinfo.gtph_port, pktinfo.gtph_port,
-				    true, false);
-		break;
-	}
-
-	return NETDEV_TX_OK;
 tx_err:
 	dev->stats.tx_errors++;
 	dev_kfree_skb(skb);
