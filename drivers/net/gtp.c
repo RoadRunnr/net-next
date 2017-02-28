@@ -172,28 +172,22 @@ static struct pdp_ctx *ip_pdp_find(struct sk_buff *skb, struct net_device *dev)
 	return ERR_PTR(-EOPNOTSUPP);
 }
 
-static bool gtp_check_src_ms_ipv4(struct sk_buff *skb, struct pdp_ctx *pctx,
-				  unsigned int hdrlen)
+static bool gtp_check_src_ms_ipv4(struct sk_buff *skb, struct pdp_ctx *pctx)
 {
-	struct iphdr *iph;
+	struct iphdr *iph = ip_hdr(skb);
 
-	if (!pskb_may_pull(skb, hdrlen + sizeof(struct iphdr)))
-		return false;
-
-	iph = (struct iphdr *)(skb->data + hdrlen);
-
-	return iph->saddr == pctx->ms_addr_ip4.s_addr;
+	return (iph->version == 4) &&
+		(iph->saddr == pctx->ms_addr_ip4.s_addr);
 }
 
 /* Check if the inner IP source address in this packet is assigned to any
  * existing mobile subscriber.
  */
-static bool gtp_check_src_ms(struct sk_buff *skb, struct pdp_ctx *pctx,
-			     unsigned int hdrlen)
+static bool gtp_check_src_ms(struct sk_buff *skb, struct pdp_ctx *pctx)
 {
 	switch (ntohs(skb->protocol)) {
 	case ETH_P_IP:
-		return gtp_check_src_ms_ipv4(skb, pctx, hdrlen);
+		return gtp_check_src_ms_ipv4(skb, pctx);
 	}
 	return false;
 }
@@ -202,25 +196,24 @@ static int gtp_rx(struct pdp_ctx *pctx, struct sk_buff *skb, unsigned int hdrlen
 {
 	struct pcpu_sw_netstats *stats;
 
-	if (!gtp_check_src_ms(skb, pctx, hdrlen)) {
-		netdev_dbg(pctx->dev, "No PDP ctx for this MS\n");
-		return 1;
-	}
-
 	/* Get rid of the GTP + UDP headers. */
-	if (iptunnel_pull_header(skb, hdrlen, skb->protocol,
+	if (iptunnel_pull_header(skb, hdrlen, htons(ETH_P_IP),
 				 !net_eq(sock_net(pctx->sk), dev_net(pctx->dev))))
 		return -1;
-
-	netdev_dbg(pctx->dev, "forwarding packet from GGSN to uplink\n");
 
 	/* Now that the UDP and the GTP header have been removed, set up the
 	 * new network header. This is required by the upper layer to
 	 * calculate the transport header.
 	 */
 	skb_reset_network_header(skb);
-
 	skb->dev = pctx->dev;
+
+	if (!gtp_check_src_ms(skb, pctx)) {
+		netdev_dbg(pctx->dev, "No PDP ctx for this MS\n");
+		return 1;
+	}
+
+	netdev_dbg(pctx->dev, "forwarding packet from GGSN to uplink\n");
 
 	stats = this_cpu_ptr(pctx->dev->tstats);
 	u64_stats_update_begin(&stats->syncp);
